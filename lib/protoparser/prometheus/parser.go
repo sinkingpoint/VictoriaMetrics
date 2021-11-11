@@ -63,6 +63,7 @@ type Row struct {
 	Tags      []Tag
 	Value     float64
 	Timestamp int64
+	Exemplar  Exemplar
 }
 
 func (r *Row) reset() {
@@ -114,12 +115,12 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 	r.reset()
 	s = skipLeadingWhitespace(s)
 	n := strings.IndexByte(s, '{')
+	var err error
 	if n >= 0 {
 		// Tags found. Parse them.
 		r.Metric = skipTrailingWhitespace(s[:n])
 		s = s[n+1:]
 		tagsStart := len(tagsPool)
-		var err error
 		s, tagsPool, err = unmarshalTags(tagsPool, s, noEscapes)
 		if err != nil {
 			return tagsPool, fmt.Errorf("cannot unmarshal tags: %w", err)
@@ -143,6 +144,14 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 		return tagsPool, fmt.Errorf("metric cannot be empty")
 	}
 	s = skipLeadingWhitespace(s)
+
+	// Try parse out an exemplar from the trailer
+	n = strings.IndexByte(s, '#')
+	if n >= 0 {
+		tagsPool, _ = r.Exemplar.unmarshalExemplar(s[n:], tagsPool, noEscapes)
+		// Skip errors - it's just a comment
+	}
+
 	s = skipTrailingComment(s)
 	if len(s) == 0 {
 		return tagsPool, fmt.Errorf("value cannot be empty")
@@ -157,7 +166,7 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 		r.Value = v
 		return tagsPool, nil
 	}
-	// There is a timestamp.
+	// There is extra metadata - timestamp, exemplar etc
 	v, err := fastfloat.Parse(s[:n])
 	if err != nil {
 		return tagsPool, fmt.Errorf("cannot parse value %q: %w", s[:n], err)
@@ -168,20 +177,34 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 		// There is no timestamp - just a whitespace after the value.
 		return tagsPool, nil
 	}
-	// There are some whitespaces after timestamp
+
+	// If the next char isn't a # then it's a timestamp
 	s = skipTrailingWhitespace(s)
-	ts, err := fastfloat.Parse(s)
-	if err != nil {
-		return tagsPool, fmt.Errorf("cannot parse timestamp %q: %w", s, err)
+	n = nextWhitespace(s)
+	var ts float64
+	if s[0] != '#' {
+		if n < 0 {
+			// There's no whitespace after the timestamp. Parse the whole thing
+			ts, err = fastfloat.Parse(s)
+		} else {
+			// There is an exemplar after the timestamp, only parse the next float
+			ts, err = fastfloat.Parse(s[:n])
+			s = skipTrailingWhitespace(s[n+1:])
+		}
+
+		if err != nil {
+			return tagsPool, fmt.Errorf("cannot parse timestamp %q: %w", s, err)
+		}
+		if ts >= -1<<31 && ts < 1<<31 {
+			// This looks like OpenMetrics timestamp in Unix seconds.
+			// Convert it to milliseconds.
+			//
+			// See https://github.com/OpenObservability/OpenMetrics/blob/master/specification/OpenMetrics.md#timestamps
+			ts *= 1000
+		}
+		r.Timestamp = int64(ts)
 	}
-	if ts >= -1<<31 && ts < 1<<31 {
-		// This looks like OpenMetrics timestamp in Unix seconds.
-		// Convert it to milliseconds.
-		//
-		// See https://github.com/OpenObservability/OpenMetrics/blob/master/specification/OpenMetrics.md#timestamps
-		ts *= 1000
-	}
-	r.Timestamp = int64(ts)
+
 	return tagsPool, nil
 }
 
@@ -230,6 +253,7 @@ func unmarshalRow(dst []Row, s string, tagsPool []Tag, noEscapes bool, errLogger
 		errLogger(msg)
 		invalidLines.Inc()
 	}
+
 	return dst, tagsPool
 }
 
@@ -680,4 +704,86 @@ var numericChars = [256]bool{
 	'e': true,
 	'E': true,
 	'.': true,
+}
+
+// Exemplar is an OpenMetrics exemplar
+type Exemplar struct {
+	Tags      []Tag
+	Value     float64
+	Timestamp float64
+}
+
+func (e *Exemplar) unmarshalExemplar(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error) {
+	// Otherwise, continue parsing the exemplar
+	if s[0] != '#' {
+		// We parsed a timestamp and arrived at something not the start of an exemplar
+		return tagsPool, fmt.Errorf("unexpected char %c - expected # to start exemplar", s[0])
+	}
+
+	// Skip to after the #
+	n := strings.IndexByte(s, '{')
+	if n < 0 {
+		return tagsPool, fmt.Errorf("missing tags in exemplar")
+	}
+
+	s = s[n+1:]
+
+	tagsStart := len(tagsPool)
+	s, tagsPool, err := unmarshalTags(tagsPool, s, noEscapes)
+	if err != nil {
+		return tagsPool, fmt.Errorf("cannot unmarshal exemplar tags: %w", err)
+	}
+	if len(s) > 0 && s[0] == ' ' {
+		// Fast path - skip whitespace.
+		s = s[1:]
+	}
+	tags := tagsPool[tagsStart:]
+	e.Tags = tags[:len(tags):len(tags)]
+
+	s = skipLeadingWhitespace(s)
+	// Bail for compatilibilities sake - previous tests ignore trailing comments,
+	// which exemplars look like. If there's no value, just skip this
+	if len(s) == 0 {
+		e.Tags = nil
+		return tagsPool[:tagsStart], nil
+	}
+
+	n = nextWhitespace(s)
+	if n < 0 {
+		// Just a value left
+		v, err := fastfloat.Parse(s)
+		if err != nil {
+			return tagsPool, fmt.Errorf("cannot parse value %q: %w", s, err)
+		}
+		e.Value = v
+		return tagsPool, nil
+	}
+
+	v, err := fastfloat.Parse(s[:n])
+	if err != nil {
+		return tagsPool, fmt.Errorf("cannot parse value %q: %w", s, err)
+	}
+	e.Value = v
+	s = skipLeadingWhitespace(s[n+1:])
+	if len(s) == 0 {
+		// All done. No timestamp
+		return tagsPool, nil
+	}
+
+	// Otherwise, parse the timestamp
+	ts, err := fastfloat.Parse(s)
+	if err != nil {
+		return tagsPool, fmt.Errorf("cannot parse exemplar timestamp %q: %w", s, err)
+	}
+
+	e.Timestamp = ts
+	if ts >= -1<<31 && ts < 1<<31 {
+		// This looks like OpenMetrics timestamp in Unix seconds.
+		// Convert it to milliseconds.
+		//
+		// See https://github.com/OpenObservability/OpenMetrics/blob/master/specification/OpenMetrics.md#timestamps
+		ts *= 1000
+	}
+
+	return tagsPool, nil
 }
