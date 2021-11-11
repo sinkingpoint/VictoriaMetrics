@@ -17,14 +17,24 @@ type Sample struct {
 
 // TimeSeries is a timeseries.
 type TimeSeries struct {
-	Labels  []Label
-	Samples []Sample
+	Labels    []Label
+	Samples   []Sample
+	Exemplars []Exemplar
 }
 
 // Label is a timeseries label
 type Label struct {
 	Name  []byte
 	Value []byte
+}
+
+type Exemplar struct {
+	// Optional, can be empty.
+	Labels []Label
+	Value  float64
+	// timestamp is in ms format, see pkg/timestamp/timestamp.go for
+	// conversion from time.Time to Prometheus timestamp.
+	Timestamp int64
 }
 
 // Unmarshal unmarshals sample from dAtA.
@@ -165,6 +175,9 @@ func (m *TimeSeries) Unmarshal(dAtA []byte, dstLabels []Label, dstSamples []Samp
 				return dstLabels, dstSamples, errInvalidLengthTypes
 			}
 			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return dstLabels, dstSamples, errInvalidLengthTypes
+			}
 			if postIndex > l {
 				return dstLabels, dstSamples, io.ErrUnexpectedEOF
 			}
@@ -201,6 +214,9 @@ func (m *TimeSeries) Unmarshal(dAtA []byte, dstLabels []Label, dstSamples []Samp
 				return dstLabels, dstSamples, errInvalidLengthTypes
 			}
 			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return dstLabels, dstSamples, errInvalidLengthTypes
+			}
 			if postIndex > l {
 				return dstLabels, dstSamples, io.ErrUnexpectedEOF
 			}
@@ -214,13 +230,48 @@ func (m *TimeSeries) Unmarshal(dAtA []byte, dstLabels []Label, dstSamples []Samp
 				return dstLabels, dstSamples, err
 			}
 			iNdEx = postIndex
+		case 3:
+			fmt.Println("Exemplar")
+			if wireType != 2 {
+				return dstLabels, dstSamples, fmt.Errorf("proto: wrong wireType = %d for field Exemplars", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return dstLabels, dstSamples, errIntOverflowTypes
+				}
+				if iNdEx >= l {
+					return dstLabels, dstSamples, io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return dstLabels, dstSamples, errInvalidLengthTypes
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return dstLabels, dstSamples, errInvalidLengthTypes
+			}
+			if postIndex > l {
+				return dstLabels, dstSamples, io.ErrUnexpectedEOF
+			}
+			m.Exemplars = append(m.Exemplars, Exemplar{})
+			if err := m.Exemplars[len(m.Exemplars)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return dstLabels, dstSamples, err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipTypes(dAtA[iNdEx:])
 			if err != nil {
 				return dstLabels, dstSamples, err
 			}
-			if skippy < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return dstLabels, dstSamples, errInvalidLengthTypes
 			}
 			if (iNdEx + skippy) > l {
@@ -447,6 +498,121 @@ func skipTypes(dAtA []byte) (n int, err error) {
 		}
 	}
 	panic("unreachable")
+}
+
+func (ex *Exemplar) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return errIntOverflowTypes
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: Exemplar: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: Exemplar: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Labels", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return errIntOverflowTypes
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return errInvalidLengthTypes
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return errInvalidLengthTypes
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			ex.Labels = append(ex.Labels, Label{})
+			if err := ex.Labels[len(ex.Labels)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 1 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Value", wireType)
+			}
+			var v uint64
+			if (iNdEx + 8) > l {
+				return io.ErrUnexpectedEOF
+			}
+			v = uint64(binary.LittleEndian.Uint64(dAtA[iNdEx:]))
+			iNdEx += 8
+			ex.Value = float64(math.Float64frombits(v))
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Timestamp", wireType)
+			}
+			ex.Timestamp = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return errIntOverflowTypes
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				ex.Timestamp |= int64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipTypes(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return errInvalidLengthTypes
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }
 
 var (
