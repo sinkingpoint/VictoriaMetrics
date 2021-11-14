@@ -97,9 +97,10 @@ type writeRequest struct {
 
 	tss []prompbmarshal.TimeSeries
 
-	labels  []prompbmarshal.Label
-	samples []prompbmarshal.Sample
-	buf     []byte
+	labels    []prompbmarshal.Label
+	samples   []prompbmarshal.Sample
+	exemplars []prompbmarshal.Exemplar
+	buf       []byte
 }
 
 func (wr *writeRequest) reset() {
@@ -111,6 +112,7 @@ func (wr *writeRequest) reset() {
 		ts := &wr.tss[i]
 		ts.Labels = nil
 		ts.Samples = nil
+		ts.Exemplars = nil
 	}
 	wr.tss = wr.tss[:0]
 
@@ -118,6 +120,7 @@ func (wr *writeRequest) reset() {
 	wr.labels = wr.labels[:0]
 
 	wr.samples = wr.samples[:0]
+	wr.exemplars = wr.exemplars[:0]
 	wr.buf = wr.buf[:0]
 }
 
@@ -182,8 +185,12 @@ func (wr *writeRequest) copyTimeSeries(dst, src *prompbmarshal.TimeSeries) {
 	samplesDst = append(samplesDst, src.Samples...)
 	dst.Samples = samplesDst[len(samplesDst)-len(src.Samples):]
 
+	exemplarsDst := append(wr.exemplars, src.Exemplars...)
+	dst.Exemplars = exemplarsDst[len(exemplarsDst)-len(src.Exemplars):]
+
 	wr.samples = samplesDst
 	wr.labels = labelsDst
+	wr.exemplars = exemplarsDst
 	wr.buf = buf
 }
 
