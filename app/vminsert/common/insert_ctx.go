@@ -17,13 +17,13 @@ type InsertCtx struct {
 	Labels sortedLabels
 
 	mrs            []storage.MetricRow
+	exemplars      []storage.ExemplarRow
 	metricNamesBuf []byte
 
 	relabelCtx relabel.Ctx
 }
 
-// Reset resets ctx for future fill with rowsLen rows.
-func (ctx *InsertCtx) Reset(rowsLen int) {
+func (ctx *InsertCtx) ResetWithExemplars(rowsLen int, exemplarsLen int) {
 	for i := range ctx.Labels {
 		label := &ctx.Labels[i]
 		label.Name = nil
@@ -42,6 +42,20 @@ func (ctx *InsertCtx) Reset(rowsLen int) {
 	ctx.mrs = ctx.mrs[:0]
 	ctx.metricNamesBuf = ctx.metricNamesBuf[:0]
 	ctx.relabelCtx.Reset()
+
+	for i := range ctx.exemplars {
+		ctx.exemplars[i].MetricNameRaw = nil
+	}
+
+	if n := exemplarsLen - cap(ctx.exemplars); n > 0 {
+		ctx.exemplars = append(ctx.exemplars[:cap(ctx.exemplars)], make([]storage.ExemplarRow, n)...)
+	}
+	ctx.exemplars = ctx.exemplars[:0]
+}
+
+// Reset resets ctx for future fill with rowsLen rows.
+func (ctx *InsertCtx) Reset(rowsLen int) {
+	ctx.ResetWithExemplars(rowsLen, 0)
 }
 
 func (ctx *InsertCtx) marshalMetricNameRaw(prefix []byte, labels []prompb.Label) []byte {
@@ -67,6 +81,24 @@ func (ctx *InsertCtx) WriteDataPointExt(metricNameRaw []byte, labels []prompb.La
 	}
 	err := ctx.addRow(metricNameRaw, timestamp, value)
 	return metricNameRaw, err
+}
+
+func (ctx *InsertCtx) WriteExemplar(metricNameRaw []byte, tsLabels []prompb.Label, exemplar *prompb.Exemplar) ([]byte, error) {
+	if len(metricNameRaw) == 0 {
+		metricNameRaw = ctx.marshalMetricNameRaw(nil, tsLabels)
+	}
+
+	exs := ctx.exemplars
+	if cap(exs) > len(exs) {
+		exs = exs[:len(exs)+1]
+	} else {
+		exs = append(exs, storage.ExemplarRow{})
+	}
+
+	ex := &exs[len(exs)-1]
+	ex.InitFromPB(metricNameRaw, exemplar)
+
+	return metricNameRaw, nil
 }
 
 func (ctx *InsertCtx) addRow(metricNameRaw []byte, timestamp int64, value float64) error {

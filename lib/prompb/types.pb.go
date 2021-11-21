@@ -231,7 +231,6 @@ func (m *TimeSeries) Unmarshal(dAtA []byte, dstLabels []Label, dstSamples []Samp
 			}
 			iNdEx = postIndex
 		case 3:
-			fmt.Println("Exemplar")
 			if wireType != 2 {
 				return dstLabels, dstSamples, fmt.Errorf("proto: wrong wireType = %d for field Exemplars", wireType)
 			}

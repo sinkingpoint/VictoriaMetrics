@@ -36,10 +36,13 @@ func insertRows(timeseries []prompb.TimeSeries, extraLabels []prompbmarshal.Labe
 	defer common.PutInsertCtx(ctx)
 
 	rowsLen := 0
+	exemplarsLen := 0
 	for i := range timeseries {
 		rowsLen += len(timeseries[i].Samples)
+		exemplarsLen += len(timeseries[i].Exemplars)
 	}
-	ctx.Reset(rowsLen)
+
+	ctx.ResetWithExemplars(rowsLen, exemplarsLen)
 	rowsTotal := 0
 	hasRelabeling := relabel.HasRelabeling()
 	for i := range timeseries {
@@ -65,6 +68,16 @@ func insertRows(timeseries []prompb.TimeSeries, extraLabels []prompbmarshal.Labe
 		var metricNameRaw []byte
 		var err error
 		samples := ts.Samples
+		exemplars := ts.Exemplars
+
+		for i := range exemplars {
+			ex := &exemplars[i]
+			metricNameRaw, err = ctx.WriteExemplar(metricNameRaw, ctx.Labels, ex)
+			if err != nil {
+				return err
+			}
+		}
+
 		for i := range samples {
 			r := &samples[i]
 			metricNameRaw, err = ctx.WriteDataPointExt(metricNameRaw, ctx.Labels, r.Timestamp, r.Value)
