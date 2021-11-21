@@ -1470,8 +1470,13 @@ func (s *Storage) ForceMergePartitions(partitionNamePrefix string) error {
 
 var rowsAddedTotal uint64
 
-// AddRows adds the given mrs to s.
 func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
+	return s.AddRowsWithExemplars(mrs, []ExemplarRow{}, precisionBits)
+}
+
+// AddRowsWithExemplars adds the given mrs and exemplars to s.
+func (s *Storage) AddRowsWithExemplars(mrs []MetricRow, exemplars []ExemplarRow, precisionBits uint8) error {
+	// Invariant: at most one exemplar per row, so len(exemplars) <= len(mrs)
 	if len(mrs) == 0 {
 		return nil
 	}
@@ -1505,6 +1510,12 @@ func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 
 	// Add rows to the storage in blocks with limited size in order to reduce memory usage.
 	var firstErr error
+	rawExemplars := make([]rawExemplar, len(exemplars))
+	err := s.addExemplars(rawExemplars, exemplars, precisionBits)
+	if err != nil {
+		firstErr = err
+	}
+
 	ic := getMetricRowsInsertCtx()
 	maxBlockLen := len(ic.rrs)
 	for len(mrs) > 0 {
@@ -1625,6 +1636,123 @@ func (s *Storage) RegisterMetricNames(mrs []MetricRow) error {
 	return nil
 }
 
+var errTimestampTooEarly = fmt.Errorf("timestamp too early for table")
+var errTimestampTooLate = fmt.Errorf("timestamp too late for table")
+
+func (s *Storage) shouldSkip(value float64, timestamp, minTime, maxTime int64) (bool, error) {
+	if math.IsNaN(value) {
+		if !decimal.IsStaleNaN(value) {
+			// Skip NaNs other than Prometheus staleness marker, since the underlying encoding
+			// doesn't know how to work with them.
+			return true, nil
+		}
+	}
+	if timestamp < minTime {
+		return true, errTimestampTooEarly
+	}
+	if timestamp > maxTime {
+		return true, errTimestampTooLate
+	}
+
+	return false, nil
+}
+
+func (s *Storage) addExemplars(rawExemplars []rawExemplar, exemplars []ExemplarRow, precisionBits uint8) error {
+	idb := s.idb()
+	j := 0
+	var (
+		// These vars are used for speeding up bulk imports of multiple adjacent rows for the same metricName.
+		prevTSID          TSID
+		prevMetricNameRaw []byte
+	)
+
+	minTimestamp, maxTimestamp := s.tb.getMinMaxTimestamps()
+	is := idb.getIndexSearch(noDeadline)
+	var metricName MetricName
+	var firstWarn error
+	for i := range exemplars {
+		ex := &exemplars[i]
+
+		if shouldSkip, err := s.shouldSkip(ex.Value, ex.Timestamp, minTimestamp, maxTimestamp); shouldSkip {
+			if err == errTimestampTooEarly {
+				// Skip rows with too small timestamps outside the retention.
+				if firstWarn == nil {
+					metricName := getUserReadableMetricName(ex.MetricNameRaw)
+					firstWarn = fmt.Errorf("cannot insert exemplar with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
+						"probably you need updating -retentionPeriod command-line flag; metricName: %s",
+						ex.Timestamp, minTimestamp, metricName)
+				}
+			} else if err == errTimestampTooLate {
+				// Skip rows with too big timestamps significantly exceeding the current time.
+				if firstWarn == nil {
+					metricName := getUserReadableMetricName(ex.MetricNameRaw)
+					firstWarn = fmt.Errorf("cannot insert exemplar with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
+						ex.Timestamp, maxTimestamp, metricName)
+				}
+			}
+
+			continue
+		}
+
+		dst := rawExemplars[j]
+		j++
+		dst.Labels = ex.Labels
+		dst.Timestamp = ex.Timestamp
+		dst.Value = ex.Value
+		if string(ex.MetricNameRaw) == string(prevMetricNameRaw) {
+			dst.TSID = prevTSID
+			continue
+		}
+		if s.getTSIDFromCache(&dst.TSID, ex.MetricNameRaw) {
+			prevTSID = dst.TSID
+			prevMetricNameRaw = ex.MetricNameRaw
+			continue
+		}
+		err := metricName.UnmarshalRaw(ex.MetricNameRaw)
+		if err != nil {
+			if firstWarn == nil {
+				firstWarn = fmt.Errorf("cannot unmarshal metricNameRaw %q: %s", ex.MetricNameRaw, err)
+			}
+			j--
+			continue
+		}
+
+		buff := []byte{}
+		err = metricName.Unmarshal(buff)
+		if err != nil {
+			if firstWarn == nil {
+				firstWarn = fmt.Errorf("cannot marshal metricName %q: %s", metricName, err)
+			}
+			j--
+			continue
+		}
+
+		if err := is.GetOrCreateTSIDByName(&dst.TSID, buff); err != nil {
+			// Do not stop adding rows on error - just skip invalid row.
+			// This guarantees that invalid rows don't prevent
+			// from adding valid rows into the storage.
+			if firstWarn == nil {
+				firstWarn = fmt.Errorf("cannot obtain or create TSID for MetricName %q: %w", &metricName, err)
+			}
+			j--
+			continue
+		}
+		s.putTSIDToCache(&dst.TSID, ex.MetricNameRaw)
+	}
+
+	if firstWarn != nil {
+		logger.Warnf(firstWarn.Error())
+	}
+
+	idb.putIndexSearch(is)
+	err := s.tb.AddExemplars(rawExemplars[:j])
+	if err != nil {
+		return fmt.Errorf("failed to add exemplars: %s", err.Error())
+	}
+
+	return nil
+}
+
 func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, precisionBits uint8) error {
 	idb := s.idb()
 	j := 0
@@ -1639,34 +1767,29 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 	var firstWarn error
 	for i := range mrs {
 		mr := &mrs[i]
-		if math.IsNaN(mr.Value) {
-			if !decimal.IsStaleNaN(mr.Value) {
-				// Skip NaNs other than Prometheus staleness marker, since the underlying encoding
-				// doesn't know how to work with them.
-				continue
+		if shouldSkip, err := s.shouldSkip(mr.Value, mr.Timestamp, minTimestamp, maxTimestamp); shouldSkip {
+			if err == errTimestampTooEarly {
+				// Skip rows with too small timestamps outside the retention.
+				if firstWarn == nil {
+					metricName := getUserReadableMetricName(mr.MetricNameRaw)
+					firstWarn = fmt.Errorf("cannot insert row with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
+						"probably you need updating -retentionPeriod command-line flag; metricName: %s",
+						mr.Timestamp, minTimestamp, metricName)
+				}
+				atomic.AddUint64(&s.tooSmallTimestampRows, 1)
+			} else if err == errTimestampTooLate {
+				// Skip rows with too big timestamps significantly exceeding the current time.
+				if firstWarn == nil {
+					metricName := getUserReadableMetricName(mr.MetricNameRaw)
+					firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
+						mr.Timestamp, maxTimestamp, metricName)
+				}
+				atomic.AddUint64(&s.tooBigTimestampRows, 1)
 			}
-		}
-		if mr.Timestamp < minTimestamp {
-			// Skip rows with too small timestamps outside the retention.
-			if firstWarn == nil {
-				metricName := getUserReadableMetricName(mr.MetricNameRaw)
-				firstWarn = fmt.Errorf("cannot insert row with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
-					"probably you need updating -retentionPeriod command-line flag; metricName: %s",
-					mr.Timestamp, minTimestamp, metricName)
-			}
-			atomic.AddUint64(&s.tooSmallTimestampRows, 1)
+
 			continue
 		}
-		if mr.Timestamp > maxTimestamp {
-			// Skip rows with too big timestamps significantly exceeding the current time.
-			if firstWarn == nil {
-				metricName := getUserReadableMetricName(mr.MetricNameRaw)
-				firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
-					mr.Timestamp, maxTimestamp, metricName)
-			}
-			atomic.AddUint64(&s.tooBigTimestampRows, 1)
-			continue
-		}
+
 		dstMrs[j] = mr
 		r := &rows[j]
 		j++

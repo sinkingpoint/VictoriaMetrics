@@ -164,8 +164,8 @@ func (ctx *InsertCtx) ApplyRelabeling() {
 
 // FlushBufs flushes buffered rows to the underlying storage.
 func (ctx *InsertCtx) FlushBufs() error {
-	err := vmstorage.AddRows(ctx.mrs)
-	ctx.Reset(0)
+	err := vmstorage.AddRowsWithExemplars(ctx.mrs, ctx.exemplars)
+	ctx.ResetWithExemplars(0, 0)
 	if err == nil {
 		return nil
 	}

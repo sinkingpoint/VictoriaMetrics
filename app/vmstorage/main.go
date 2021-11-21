@@ -120,16 +120,20 @@ var WG syncwg.WaitGroup
 // resetResponseCacheIfNeeded is a callback for automatic resetting of response cache if needed.
 var resetResponseCacheIfNeeded func(mrs []storage.MetricRow)
 
-// AddRows adds mrs to the storage.
-func AddRows(mrs []storage.MetricRow) error {
+func AddRowsWithExemplars(mrs []storage.MetricRow, exemplars []storage.ExemplarRow) error {
 	if Storage.IsReadOnly() {
 		return errReadOnly
 	}
 	resetResponseCacheIfNeeded(mrs)
 	WG.Add(1)
-	err := Storage.AddRows(mrs, uint8(*precisionBits))
+	err := Storage.AddRowsWithExemplars(mrs, exemplars, uint8(*precisionBits))
 	WG.Done()
 	return err
+}
+
+// AddRows adds mrs to the storage.
+func AddRows(mrs []storage.MetricRow) error {
+	return AddRowsWithExemplars(mrs, []storage.ExemplarRow{})
 }
 
 var errReadOnly = errors.New("the storage is in read-only mode; check -storage.minFreeDiskSpaceBytes command-line flag value")

@@ -261,6 +261,10 @@ func (tb *table) ForceMergePartitions(partitionNamePrefix string) error {
 	return nil
 }
 
+func (tb *table) AddExemplars(exemplars []rawExemplar) error {
+	return nil
+}
+
 // AddRows adds the given rows to the table tb.
 func (tb *table) AddRows(rows []rawRow) error {
 	if len(rows) == 0 {

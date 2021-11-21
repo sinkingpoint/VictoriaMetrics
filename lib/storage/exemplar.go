@@ -32,3 +32,12 @@ func (e *ExemplarRow) InitFromPB(metricNameRaw []byte, rawExemplar *prompb.Exemp
 	e.Timestamp = rawExemplar.Timestamp
 	e.Value = rawExemplar.Value
 }
+
+type rawExemplar struct {
+	TSID TSID
+
+	Labels        []Tag
+	Timestamp     int64
+	Value         float64
+	PrecisionBits uint8
+}
