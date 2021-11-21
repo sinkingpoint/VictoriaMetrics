@@ -1510,15 +1510,24 @@ func (s *Storage) AddRowsWithExemplars(mrs []MetricRow, exemplars []ExemplarRow,
 
 	// Add rows to the storage in blocks with limited size in order to reduce memory usage.
 	var firstErr error
-	rawExemplars := make([]rawExemplar, len(exemplars))
-	err := s.addExemplars(rawExemplars, exemplars, precisionBits)
-	if err != nil {
-		firstErr = err
-	}
 
 	ic := getMetricRowsInsertCtx()
 	maxBlockLen := len(ic.rrs)
+	maxExemplarBlockLen := len(ic.rex)
 	for len(mrs) > 0 {
+		exsBlock := exemplars
+		if len(exemplars) > maxExemplarBlockLen {
+			exsBlock = exemplars[:maxExemplarBlockLen]
+			exemplars = exemplars[maxExemplarBlockLen:]
+		}
+
+		if err := s.addExemplars(ic.rex, ic.tmpExs, exsBlock, precisionBits); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
 		mrsBlock := mrs
 		if len(mrs) > maxBlockLen {
 			mrsBlock = mrs[:maxBlockLen]
@@ -1526,6 +1535,7 @@ func (s *Storage) AddRowsWithExemplars(mrs []MetricRow, exemplars []ExemplarRow,
 		} else {
 			mrs = nil
 		}
+
 		if err := s.add(ic.rrs, ic.tmpMrs, mrsBlock, precisionBits); err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1544,6 +1554,9 @@ func (s *Storage) AddRowsWithExemplars(mrs []MetricRow, exemplars []ExemplarRow,
 type metricRowsInsertCtx struct {
 	rrs    []rawRow
 	tmpMrs []*MetricRow
+
+	rex    []rawExemplar
+	tmpExs []*ExemplarRow
 }
 
 func getMetricRowsInsertCtx() *metricRowsInsertCtx {
@@ -1552,6 +1565,8 @@ func getMetricRowsInsertCtx() *metricRowsInsertCtx {
 		v = &metricRowsInsertCtx{
 			rrs:    make([]rawRow, maxMetricRowsPerBlock),
 			tmpMrs: make([]*MetricRow, maxMetricRowsPerBlock),
+			rex:    make([]rawExemplar, maxMetricRowsPerBlock),
+			tmpExs: make([]*ExemplarRow, maxMetricRowsPerBlock),
 		}
 	}
 	return v.(*metricRowsInsertCtx)
@@ -1657,7 +1672,7 @@ func (s *Storage) shouldSkip(value float64, timestamp, minTime, maxTime int64) (
 	return false, nil
 }
 
-func (s *Storage) addExemplars(rawExemplars []rawExemplar, exemplars []ExemplarRow, precisionBits uint8) error {
+func (s *Storage) addExemplars(rows []rawExemplar, dstExs []*ExemplarRow, exs []ExemplarRow, precisionBits uint8) error {
 	idb := s.idb()
 	j := 0
 	var (
@@ -1665,91 +1680,139 @@ func (s *Storage) addExemplars(rawExemplars []rawExemplar, exemplars []ExemplarR
 		prevTSID          TSID
 		prevMetricNameRaw []byte
 	)
-
+	var pmrs *pendingExemplarRows
 	minTimestamp, maxTimestamp := s.tb.getMinMaxTimestamps()
-	is := idb.getIndexSearch(noDeadline)
-	var metricName MetricName
+	// Return only the first error, since it has no sense in returning all errors.
 	var firstWarn error
-	for i := range exemplars {
-		ex := &exemplars[i]
-
+	for i := range exs {
+		ex := &exs[i]
 		if shouldSkip, err := s.shouldSkip(ex.Value, ex.Timestamp, minTimestamp, maxTimestamp); shouldSkip {
 			if err == errTimestampTooEarly {
 				// Skip rows with too small timestamps outside the retention.
 				if firstWarn == nil {
 					metricName := getUserReadableMetricName(ex.MetricNameRaw)
-					firstWarn = fmt.Errorf("cannot insert exemplar with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
+					firstWarn = fmt.Errorf("cannot insert row with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
 						"probably you need updating -retentionPeriod command-line flag; metricName: %s",
 						ex.Timestamp, minTimestamp, metricName)
 				}
+				atomic.AddUint64(&s.tooSmallTimestampRows, 1)
 			} else if err == errTimestampTooLate {
 				// Skip rows with too big timestamps significantly exceeding the current time.
 				if firstWarn == nil {
 					metricName := getUserReadableMetricName(ex.MetricNameRaw)
-					firstWarn = fmt.Errorf("cannot insert exemplar with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
+					firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
 						ex.Timestamp, maxTimestamp, metricName)
 				}
+				atomic.AddUint64(&s.tooBigTimestampRows, 1)
 			}
 
 			continue
 		}
 
-		dst := rawExemplars[j]
+		dstExs[j] = ex
+		r := &rows[j]
 		j++
-		dst.Labels = ex.Labels
-		dst.Timestamp = ex.Timestamp
-		dst.Value = ex.Value
+		r.Timestamp = ex.Timestamp
+		r.Value = ex.Value
+		r.PrecisionBits = precisionBits
 		if string(ex.MetricNameRaw) == string(prevMetricNameRaw) {
-			dst.TSID = prevTSID
+			// Fast path - the current mr contains the same metric name as the previous mr, so it contains the same TSID.
+			// This path should trigger on bulk imports when many rows contain the same MetricNameRaw.
+			r.TSID = prevTSID
 			continue
 		}
-		if s.getTSIDFromCache(&dst.TSID, ex.MetricNameRaw) {
-			prevTSID = dst.TSID
+		if s.getTSIDFromCache(&r.TSID, ex.MetricNameRaw) {
+			if s.isSeriesCardinalityExceeded(r.TSID.MetricID, ex.MetricNameRaw) {
+				// Skip the row, since the limit on the number of unique series has been exceeded.
+				j--
+				continue
+			}
+			// Fast path - the TSID for the given MetricNameRaw has been found in cache and isn't deleted.
+			// There is no need in checking whether r.TSID.MetricID is deleted, since tsidCache doesn't
+			// contain MetricName->TSID entries for deleted time series.
+			// See Storage.DeleteMetrics code for details.
+			prevTSID = r.TSID
 			prevMetricNameRaw = ex.MetricNameRaw
 			continue
 		}
-		err := metricName.UnmarshalRaw(ex.MetricNameRaw)
-		if err != nil {
-			if firstWarn == nil {
-				firstWarn = fmt.Errorf("cannot unmarshal metricNameRaw %q: %s", ex.MetricNameRaw, err)
-			}
-			j--
-			continue
-		}
 
-		buff := []byte{}
-		err = metricName.Unmarshal(buff)
-		if err != nil {
-			if firstWarn == nil {
-				firstWarn = fmt.Errorf("cannot marshal metricName %q: %s", metricName, err)
-			}
-			j--
-			continue
+		// Slow path - the TSID is missing in the cache.
+		// Postpone its search in the loop below.
+		j--
+		if pmrs == nil {
+			pmrs = getPendingExemplarRows()
 		}
-
-		if err := is.GetOrCreateTSIDByName(&dst.TSID, buff); err != nil {
+		if err := pmrs.addRow(ex); err != nil {
 			// Do not stop adding rows on error - just skip invalid row.
 			// This guarantees that invalid rows don't prevent
 			// from adding valid rows into the storage.
 			if firstWarn == nil {
-				firstWarn = fmt.Errorf("cannot obtain or create TSID for MetricName %q: %w", &metricName, err)
+				firstWarn = err
 			}
-			j--
 			continue
 		}
-		s.putTSIDToCache(&dst.TSID, ex.MetricNameRaw)
 	}
-
+	if pmrs != nil {
+		// Sort pendingMetricRows by canonical metric name in order to speed up search via `is` in the loop below.
+		pendingMetricRows := pmrs.pexs
+		sort.Slice(pendingMetricRows, func(i, j int) bool {
+			return string(pendingMetricRows[i].MetricName) < string(pendingMetricRows[j].MetricName)
+		})
+		is := idb.getIndexSearch(noDeadline)
+		prevMetricNameRaw = nil
+		var slowInsertsCount uint64
+		for i := range pendingMetricRows {
+			pmr := &pendingMetricRows[i]
+			mr := pmr.mr
+			dstExs[j] = mr
+			r := &rows[j]
+			j++
+			r.Timestamp = mr.Timestamp
+			r.Value = mr.Value
+			r.PrecisionBits = precisionBits
+			if string(mr.MetricNameRaw) == string(prevMetricNameRaw) {
+				// Fast path - the current mr contains the same metric name as the previous mr, so it contains the same TSID.
+				// This path should trigger on bulk imports when many rows contain the same MetricNameRaw.
+				r.TSID = prevTSID
+				continue
+			}
+			slowInsertsCount++
+			if err := is.GetOrCreateTSIDByName(&r.TSID, pmr.MetricName); err != nil {
+				// Do not stop adding rows on error - just skip invalid row.
+				// This guarantees that invalid rows don't prevent
+				// from adding valid rows into the storage.
+				if firstWarn == nil {
+					firstWarn = fmt.Errorf("cannot obtain or create TSID for MetricName %q: %w", pmr.MetricName, err)
+				}
+				j--
+				continue
+			}
+			if s.isSeriesCardinalityExceeded(r.TSID.MetricID, mr.MetricNameRaw) {
+				// Skip the row, since the limit on the number of unique series has been exceeded.
+				j--
+				continue
+			}
+			s.putTSIDToCache(&r.TSID, mr.MetricNameRaw)
+			prevTSID = r.TSID
+			prevMetricNameRaw = mr.MetricNameRaw
+		}
+		idb.putIndexSearch(is)
+		putPendingExemplarRows(pmrs)
+		atomic.AddUint64(&s.slowRowInserts, slowInsertsCount)
+	}
 	if firstWarn != nil {
-		logger.Warnf(firstWarn.Error())
+		logger.Warnf("warn occurred during rows addition: %s", firstWarn)
 	}
+	dstExs = dstExs[:j]
+	rows = rows[:j]
 
-	idb.putIndexSearch(is)
-	err := s.tb.AddExemplars(rawExemplars[:j])
-	if err != nil {
-		return fmt.Errorf("failed to add exemplars: %s", err.Error())
+	var firstError error
+	if err := s.tb.AddExemplars(rows); err != nil {
+		firstError = fmt.Errorf("cannot add rows to table: %w", err)
 	}
-
+	if firstError != nil {
+		return fmt.Errorf("error occurred during rows addition: %w", firstError)
+	}
 	return nil
 }
 
@@ -1990,6 +2053,67 @@ func getPendingMetricRows() *pendingMetricRows {
 func putPendingMetricRows(pmrs *pendingMetricRows) {
 	pmrs.reset()
 	pendingMetricRowsPool.Put(pmrs)
+}
+
+var pendingExemplarRowsPool sync.Pool
+
+type pendingExemplarRow struct {
+	MetricName []byte
+	mr         *ExemplarRow
+}
+
+type pendingExemplarRows struct {
+	pexs           []pendingExemplarRow
+	metricNamesBuf []byte
+
+	lastMetricNameRaw []byte
+	lastMetricName    []byte
+	mn                MetricName
+}
+
+func (pexs *pendingExemplarRows) reset() {
+	for _, pmr := range pexs.pexs {
+		pmr.MetricName = nil
+		pmr.mr = nil
+	}
+	pexs.pexs = pexs.pexs[:0]
+	pexs.metricNamesBuf = pexs.metricNamesBuf[:0]
+	pexs.lastMetricNameRaw = nil
+	pexs.lastMetricName = nil
+	pexs.mn.Reset()
+}
+
+func (pmrs *pendingExemplarRows) addRow(mr *ExemplarRow) error {
+	// Do not spend CPU time on re-calculating canonical metricName during bulk import
+	// of many rows for the same metric.
+	if string(mr.MetricNameRaw) != string(pmrs.lastMetricNameRaw) {
+		if err := pmrs.mn.UnmarshalRaw(mr.MetricNameRaw); err != nil {
+			return fmt.Errorf("cannot unmarshal MetricNameRaw %q: %w", mr.MetricNameRaw, err)
+		}
+		pmrs.mn.sortTags()
+		metricNamesBufLen := len(pmrs.metricNamesBuf)
+		pmrs.metricNamesBuf = pmrs.mn.Marshal(pmrs.metricNamesBuf)
+		pmrs.lastMetricName = pmrs.metricNamesBuf[metricNamesBufLen:]
+		pmrs.lastMetricNameRaw = mr.MetricNameRaw
+	}
+	pmrs.pexs = append(pmrs.pexs, pendingExemplarRow{
+		MetricName: pmrs.lastMetricName,
+		mr:         mr,
+	})
+	return nil
+}
+
+func getPendingExemplarRows() *pendingExemplarRows {
+	v := pendingExemplarRowsPool.Get()
+	if v == nil {
+		v = &pendingExemplarRows{}
+	}
+	return v.(*pendingExemplarRows)
+}
+
+func putPendingExemplarRows(pmrs *pendingExemplarRows) {
+	pmrs.reset()
+	pendingExemplarRowsPool.Put(pmrs)
 }
 
 var pendingMetricRowsPool sync.Pool
