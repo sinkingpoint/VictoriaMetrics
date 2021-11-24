@@ -42,8 +42,16 @@ type rawExemplar struct {
 	PrecisionBits uint8
 }
 
-type rawExemplarMarshaler struct{}
+type rawExemplarIndexBlock struct {
+	timestampsOffset int64
+	valuesOffset     int64
+	tagsOffset       int64
+}
+
+type rawExemplarMarshaler struct {
+}
 
 func (rem *rawExemplarMarshaler) marshalToInmemoryPart(mp *inmemoryPart, exemplars []rawExemplar) {
+	// TODO: Sort the exemplars
 
 }

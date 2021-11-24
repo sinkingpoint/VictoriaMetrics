@@ -11,11 +11,10 @@ import (
 type inmemoryPart struct {
 	ph partHeader
 
-	timestampsData bytesutil.ByteBuffer
-	valuesData     bytesutil.ByteBuffer
-	indexData      bytesutil.ByteBuffer
-	metaindexData  bytesutil.ByteBuffer
-
+	timestampsData    bytesutil.ByteBuffer
+	valuesData        bytesutil.ByteBuffer
+	indexData         bytesutil.ByteBuffer
+	metaindexData     bytesutil.ByteBuffer
 	exemplarData      bytesutil.ByteBuffer
 	exemplarIndexData bytesutil.ByteBuffer
 
@@ -57,8 +56,8 @@ func (mp *inmemoryPart) InitFromRows(rows []rawRow) {
 // It is unsafe re-using mp while the returned part is in use.
 func (mp *inmemoryPart) NewPart() (*part, error) {
 	ph := mp.ph
-	size := uint64(len(mp.timestampsData.B) + len(mp.valuesData.B) + len(mp.indexData.B) + len(mp.metaindexData.B))
-	return newPart(&ph, "", size, mp.metaindexData.NewReader(), &mp.timestampsData, &mp.valuesData, &mp.indexData)
+	size := uint64(len(mp.timestampsData.B) + len(mp.valuesData.B) + len(mp.indexData.B) + len(mp.metaindexData.B) + len(mp.exemplarData.B) + len(mp.exemplarIndexData.B))
+	return newPart(&ph, "", size, mp.metaindexData.NewReader(), &mp.timestampsData, &mp.valuesData, &mp.indexData, &mp.exemplarData, &mp.exemplarIndexData)
 }
 
 func getInmemoryPart() *inmemoryPart {

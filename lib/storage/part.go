@@ -42,9 +42,11 @@ type part struct {
 	// Total size in bytes of part data.
 	size uint64
 
-	timestampsFile fs.MustReadAtCloser
-	valuesFile     fs.MustReadAtCloser
-	indexFile      fs.MustReadAtCloser
+	timestampsFile     fs.MustReadAtCloser
+	valuesFile         fs.MustReadAtCloser
+	indexFile          fs.MustReadAtCloser
+	exemplarsFile      fs.MustReadAtCloser
+	exemplarsIndexFile fs.MustReadAtCloser
 
 	metaindex []metaindexRow
 
@@ -82,15 +84,23 @@ func openFilePart(path string) (*part, error) {
 	}
 	metaindexSize := fs.MustFileSize(metaindexPath)
 
-	size := timestampsSize + valuesSize + indexSize + metaindexSize
-	return newPart(&ph, path, size, metaindexFile, timestampsFile, valuesFile, indexFile)
+	exemplarsPath := path + "/exemplars.bin"
+	exemplarsFile := fs.MustOpenReaderAt(exemplarsPath)
+	exemplarsSize := fs.MustFileSize(exemplarsPath)
+
+	exemplarsIndexPath := path + "/exemplarsindex.bin"
+	exemplarsIndexFile := fs.MustOpenReaderAt(exemplarsIndexPath)
+	exemplarsIndexSize := fs.MustFileSize(exemplarsIndexPath)
+
+	size := timestampsSize + valuesSize + indexSize + metaindexSize + exemplarsSize + exemplarsIndexSize
+	return newPart(&ph, path, size, metaindexFile, timestampsFile, valuesFile, indexFile, exemplarsFile, exemplarsIndexFile)
 }
 
 // newPart returns new part initialized with the given arguments.
 //
 // The returned part calls MustClose on all the files passed to newPart
 // when calling part.MustClose.
-func newPart(ph *partHeader, path string, size uint64, metaindexReader filestream.ReadCloser, timestampsFile, valuesFile, indexFile fs.MustReadAtCloser) (*part, error) {
+func newPart(ph *partHeader, path string, size uint64, metaindexReader filestream.ReadCloser, timestampsFile, valuesFile, indexFile, exemplarsFile, exemplarsIndexFile fs.MustReadAtCloser) (*part, error) {
 	var errors []error
 	metaindex, err := unmarshalMetaindexRows(nil, metaindexReader)
 	if err != nil {
@@ -105,6 +115,8 @@ func newPart(ph *partHeader, path string, size uint64, metaindexReader filestrea
 	p.timestampsFile = timestampsFile
 	p.valuesFile = valuesFile
 	p.indexFile = indexFile
+	p.exemplarsFile = exemplarsFile
+	p.exemplarsIndexFile = exemplarsIndexFile
 
 	p.metaindex = metaindex
 	p.ibCache = newIndexBlockCache()
