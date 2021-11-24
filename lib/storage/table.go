@@ -262,6 +262,114 @@ func (tb *table) ForceMergePartitions(partitionNamePrefix string) error {
 }
 
 func (tb *table) AddExemplars(exemplars []rawExemplar) error {
+	if len(exemplars) == 0 {
+		return nil
+	}
+
+	// Verify whether all the rows may be added to a single partition.
+	ptwsX := getPartitionWrappers()
+	defer putPartitionWrappers(ptwsX)
+
+	ptwsX.a = tb.GetPartitions(ptwsX.a[:0])
+	ptws := ptwsX.a
+	for i, ptw := range ptws {
+		singlePt := true
+		for j := range exemplars {
+			if !ptw.pt.HasTimestamp(exemplars[j].Timestamp) {
+				singlePt = false
+				break
+			}
+		}
+		if !singlePt {
+			continue
+		}
+
+		if i != 0 {
+			// Move the partition with the matching rows to the front of tb.ptws,
+			// so it will be detected faster next time.
+			tb.ptwsLock.Lock()
+			for j := range tb.ptws {
+				if ptw == tb.ptws[j] {
+					tb.ptws[0], tb.ptws[j] = tb.ptws[j], tb.ptws[0]
+					break
+				}
+			}
+			tb.ptwsLock.Unlock()
+		}
+
+		// Fast path - add all the rows into the ptw.
+		ptw.pt.AddExemplars(exemplars)
+		tb.PutPartitions(ptws)
+		return nil
+	}
+
+	// Slower path - split rows into per-partition buckets.
+	ptBuckets := make(map[*partitionWrapper][]rawExemplar)
+	var missingExemplars []rawExemplar
+	for i := range exemplars {
+		r := &exemplars[i]
+		ptFound := false
+		for _, ptw := range ptws {
+			if ptw.pt.HasTimestamp(r.Timestamp) {
+				ptBuckets[ptw] = append(ptBuckets[ptw], *r)
+				ptFound = true
+				break
+			}
+		}
+		if !ptFound {
+			missingExemplars = append(missingExemplars, *r)
+		}
+	}
+
+	for ptw, ptExemplars := range ptBuckets {
+		ptw.pt.AddExemplars(ptExemplars)
+	}
+	tb.PutPartitions(ptws)
+	if len(missingExemplars) == 0 {
+		return nil
+	}
+
+	// The slowest path - there are rows that don't fit any existing partition.
+	// Create new partitions for these rows.
+	// Do this under tb.ptwsLock.
+	minTimestamp, maxTimestamp := tb.getMinMaxTimestamps()
+	tb.ptwsLock.Lock()
+	var errors []error
+	for i := range missingExemplars {
+		r := &missingExemplars[i]
+
+		if r.Timestamp < minTimestamp || r.Timestamp > maxTimestamp {
+			// Silently skip row outside retention, since it should be deleted anyway.
+			continue
+		}
+
+		// Make sure the partition for the r hasn't been added by another goroutines.
+		ptFound := false
+		for _, ptw := range tb.ptws {
+			if ptw.pt.HasTimestamp(r.Timestamp) {
+				ptFound = true
+				ptw.pt.AddExemplars(missingExemplars[i : i+1])
+				break
+			}
+		}
+		if ptFound {
+			continue
+		}
+
+		pt, err := createPartition(r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.getDeletedMetricIDs, tb.retentionMsecs)
+		if err != nil {
+			errors = append(errors, err)
+			continue
+		}
+		pt.AddExemplars(missingExemplars[i : i+1])
+		tb.addPartitionNolock(pt)
+	}
+	tb.ptwsLock.Unlock()
+
+	if len(errors) > 0 {
+		// Return only the first error, since it has no sense in returning all errors.
+		return fmt.Errorf("errors while adding exemplars to table %q: %w", tb.path, errors[0])
+	}
 	return nil
 }
 

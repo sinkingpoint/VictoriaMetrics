@@ -41,3 +41,9 @@ type rawExemplar struct {
 	Value         float64
 	PrecisionBits uint8
 }
+
+type rawExemplarMarshaler struct{}
+
+func (rem *rawExemplarMarshaler) marshalToInmemoryPart(mp *inmemoryPart, exemplars []rawExemplar) {
+
+}

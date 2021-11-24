@@ -435,6 +435,25 @@ func (pt *partition) AddRows(rows []rawRow) {
 	pt.rawRows.addRows(pt, rows)
 }
 
+func (pt *partition) AddExemplars(exemplars []rawExemplar) {
+	if len(exemplars) == 0 {
+		return
+	}
+
+	// Validate all the exemplars.
+	for i := range exemplars {
+		e := &exemplars[i]
+		if !pt.HasTimestamp(e.Timestamp) {
+			logger.Panicf("BUG: row %+v has Timestamp outside partition %q range %+v", e, pt.smallPartsPath, &pt.tr)
+		}
+		if err := encoding.CheckPrecisionBits(e.PrecisionBits); err != nil {
+			logger.Panicf("BUG: row %+v has invalid PrecisionBits: %s", e, err)
+		}
+	}
+
+	pt.rawRows.addExemplars(pt, exemplars)
+}
+
 type rawRowsShards struct {
 	shardIdx uint32
 
@@ -454,6 +473,14 @@ func (rrss *rawRowsShards) addRows(pt *partition, rows []rawRow) {
 	shard.addRows(pt, rows)
 }
 
+func (rrss *rawRowsShards) addExemplars(pt *partition, exs []rawExemplar) {
+	n := rrss.shardIdx
+	shards := rrss.shards
+	idx := n % uint32(len(shards))
+	shard := &shards[idx]
+	shard.addExemplars(pt, exs)
+}
+
 func (rrss *rawRowsShards) Len() int {
 	n := 0
 	for i := range rrss.shards[:] {
@@ -463,9 +490,11 @@ func (rrss *rawRowsShards) Len() int {
 }
 
 type rawRowsShard struct {
-	mu            sync.Mutex
-	rows          []rawRow
-	lastFlushTime uint64
+	mu               sync.Mutex
+	exemplars        []rawExemplar
+	exemplarsToFlush []rawExemplar
+	rows             []rawRow
+	lastFlushTime    uint64
 }
 
 func (rrs *rawRowsShard) Len() int {
@@ -475,8 +504,29 @@ func (rrs *rawRowsShard) Len() int {
 	return n
 }
 
+func (rrs *rawRowsShard) addExemplars(pt *partition, exemplars []rawExemplar) {
+	rrs.mu.Lock()
+	if cap(rrs.exemplars) == 0 {
+		n := getMaxRawRowsPerShard()
+		rrs.exemplars = make([]rawExemplar, 0, n)
+		rrs.exemplarsToFlush = make([]rawExemplar, 0, n)
+	}
+	maxRowsCount := cap(rrs.exemplars)
+	capacity := maxRowsCount - len(rrs.exemplars)
+	if capacity >= len(exemplars) {
+		// Fast path - rows fit capacity.
+		rrs.exemplars = append(rrs.exemplars, exemplars...)
+	} else {
+		rrs.exemplarsToFlush = append(rrs.exemplarsToFlush, rrs.exemplars...)
+		rrs.exemplarsToFlush = append(rrs.exemplarsToFlush, exemplars...)
+		rrs.exemplars = rrs.exemplars[:0]
+	}
+	rrs.mu.Unlock()
+}
+
 func (rrs *rawRowsShard) addRows(pt *partition, rows []rawRow) {
 	var rowsToFlush []rawRow
+	var exemplarsToFlush []rawExemplar
 
 	rrs.mu.Lock()
 	if cap(rrs.rows) == 0 {
@@ -493,15 +543,19 @@ func (rrs *rawRowsShard) addRows(pt *partition, rows []rawRow) {
 		// Put rrs.rows and rows to rowsToFlush and convert it to a part.
 		rowsToFlush = append(rowsToFlush, rrs.rows...)
 		rowsToFlush = append(rowsToFlush, rows...)
+		exemplarsToFlush = rrs.exemplarsToFlush
+
+		rrs.exemplars = rrs.exemplars[:0]
+		rrs.exemplarsToFlush = rrs.exemplarsToFlush[:0]
 		rrs.rows = rrs.rows[:0]
 		rrs.lastFlushTime = fasttime.UnixTimestamp()
 	}
 	rrs.mu.Unlock()
 
-	pt.flushRowsToParts(rowsToFlush)
+	pt.flushRowsToParts(rowsToFlush, exemplarsToFlush)
 }
 
-func (pt *partition) flushRowsToParts(rows []rawRow) {
+func (pt *partition) flushRowsToParts(rows []rawRow, exemplarsToFlush []rawExemplar) {
 	maxRows := getMaxRawRowsPerShard()
 	var wg sync.WaitGroup
 	for len(rows) > 0 {
@@ -509,17 +563,24 @@ func (pt *partition) flushRowsToParts(rows []rawRow) {
 		if n > len(rows) {
 			n = len(rows)
 		}
+
+		m := maxRows
+		if m > len(exemplarsToFlush) {
+			m = len(exemplarsToFlush)
+		}
+
 		wg.Add(1)
-		go func(rowsPart []rawRow) {
+		go func(rowsPart []rawRow, exemplars []rawExemplar) {
 			defer wg.Done()
-			pt.addRowsPart(rowsPart)
-		}(rows[:n])
+			pt.addRowsPart(rowsPart, exemplars)
+		}(rows[:n], exemplarsToFlush[:m])
 		rows = rows[n:]
+		exemplarsToFlush = exemplarsToFlush[m:]
 	}
 	wg.Wait()
 }
 
-func (pt *partition) addRowsPart(rows []rawRow) {
+func (pt *partition) addRowsPart(rows []rawRow, exemplars []rawExemplar) {
 	if len(rows) == 0 {
 		return
 	}
@@ -716,27 +777,34 @@ func (pt *partition) flushRawRows(isFinal bool) {
 
 func (rrss *rawRowsShards) flush(pt *partition, isFinal bool) {
 	var rowsToFlush []rawRow
+	var exemplarsToFlush []rawExemplar
 	for i := range rrss.shards {
-		rowsToFlush = rrss.shards[i].appendRawRowsToFlush(rowsToFlush, pt, isFinal)
+		rowsToFlush, exemplarsToFlush = rrss.shards[i].appendRawRowsToFlush(rowsToFlush, exemplarsToFlush, pt, isFinal)
 	}
-	pt.flushRowsToParts(rowsToFlush)
+	pt.flushRowsToParts(rowsToFlush, exemplarsToFlush)
 }
 
-func (rrs *rawRowsShard) appendRawRowsToFlush(dst []rawRow, pt *partition, isFinal bool) []rawRow {
+func (rrs *rawRowsShard) appendRawRowsToFlush(dst []rawRow, exemplarsToFlush []rawExemplar, pt *partition, isFinal bool) ([]rawRow, []rawExemplar) {
 	currentTime := fasttime.UnixTimestamp()
 	flushSeconds := int64(rawRowsFlushInterval.Seconds())
 	if flushSeconds <= 0 {
 		flushSeconds = 1
 	}
 
+	exemplarsToFlush = append(exemplarsToFlush, rrs.exemplarsToFlush...)
+	rrs.exemplarsToFlush = rrs.exemplarsToFlush[:0]
+
 	rrs.mu.Lock()
 	if isFinal || currentTime-rrs.lastFlushTime > uint64(flushSeconds) {
 		dst = append(dst, rrs.rows...)
 		rrs.rows = rrs.rows[:0]
+
+		exemplarsToFlush = append(exemplarsToFlush, rrs.exemplars...)
+		rrs.exemplars = rrs.exemplars[:0]
 	}
 	rrs.mu.Unlock()
 
-	return dst
+	return dst, exemplarsToFlush
 }
 
 func (pt *partition) startInmemoryPartsFlusher() {

@@ -16,6 +16,9 @@ type inmemoryPart struct {
 	indexData      bytesutil.ByteBuffer
 	metaindexData  bytesutil.ByteBuffer
 
+	exemplarData      bytesutil.ByteBuffer
+	exemplarIndexData bytesutil.ByteBuffer
+
 	creationTime uint64
 }
 
@@ -31,8 +34,7 @@ func (mp *inmemoryPart) Reset() {
 	mp.creationTime = 0
 }
 
-// InitFromRows initializes mp from the given rows.
-func (mp *inmemoryPart) InitFromRows(rows []rawRow) {
+func (mp *inmemoryPart) InitFromRowsWithExemplars(rows []rawRow, exemplars []rawExemplar) {
 	if len(rows) == 0 {
 		logger.Panicf("BUG: Inmemory.InitFromRows must accept at least one row")
 	}
@@ -42,6 +44,11 @@ func (mp *inmemoryPart) InitFromRows(rows []rawRow) {
 	rrm.marshalToInmemoryPart(mp, rows)
 	putRawRowsMarshaler(rrm)
 	mp.creationTime = fasttime.UnixTimestamp()
+}
+
+// InitFromRows initializes mp from the given rows.
+func (mp *inmemoryPart) InitFromRows(rows []rawRow) {
+	mp.InitFromRowsWithExemplars(rows, []rawExemplar{})
 }
 
 // NewPart creates new part from mp.
