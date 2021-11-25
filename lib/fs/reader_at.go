@@ -111,6 +111,37 @@ func MustOpenReaderAt(path string) *ReaderAt {
 	return &r
 }
 
+func MustOpenOrCreateReaderAt(path string) *ReaderAt {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		f, err := os.Create(path)
+		if err != nil {
+			logger.Panicf("FATAL: cannot open file %q for reading: %s", path, err)
+		}
+
+		var r ReaderAt
+		r.f = f
+		if !*disableMmap {
+			fi, err := f.Stat()
+			if err != nil {
+				MustClose(f)
+				logger.Panicf("FATAL: error in fstat(%q): %s", path, err)
+			}
+			size := fi.Size()
+			data, err := mmapFile(f, size)
+			if err != nil {
+				MustClose(f)
+				logger.Panicf("FATAL: cannot mmap %q: %s", path, err)
+			}
+			r.mmapData = data
+		}
+		
+		readersCount.Inc()
+		return &r
+	}
+
+	return MustOpenReaderAt(path)
+}
+
 var (
 	readCalls    = metrics.NewCounter(`vm_fs_read_calls_total`)
 	readBytes    = metrics.NewCounter(`vm_fs_read_bytes_total`)
