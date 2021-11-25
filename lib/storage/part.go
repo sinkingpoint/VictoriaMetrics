@@ -85,11 +85,11 @@ func openFilePart(path string) (*part, error) {
 	metaindexSize := fs.MustFileSize(metaindexPath)
 
 	exemplarsPath := path + "/exemplars.bin"
-	exemplarsFile := fs.MustOpenReaderAt(exemplarsPath)
+	exemplarsFile := fs.MustOpenOrCreateReaderAt(exemplarsPath)
 	exemplarsSize := fs.MustFileSize(exemplarsPath)
 
 	exemplarsIndexPath := path + "/exemplarsindex.bin"
-	exemplarsIndexFile := fs.MustOpenReaderAt(exemplarsIndexPath)
+	exemplarsIndexFile := fs.MustOpenOrCreateReaderAt(exemplarsIndexPath)
 	exemplarsIndexSize := fs.MustFileSize(exemplarsIndexPath)
 
 	size := timestampsSize + valuesSize + indexSize + metaindexSize + exemplarsSize + exemplarsIndexSize
