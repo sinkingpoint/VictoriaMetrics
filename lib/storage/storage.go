@@ -1691,7 +1691,7 @@ func (s *Storage) addExemplars(rows []rawExemplar, dstExs []*ExemplarRow, exs []
 				// Skip rows with too small timestamps outside the retention.
 				if firstWarn == nil {
 					metricName := getUserReadableMetricName(ex.MetricNameRaw)
-					firstWarn = fmt.Errorf("cannot insert row with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
+					firstWarn = fmt.Errorf("cannot insert exemplar with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
 						"probably you need updating -retentionPeriod command-line flag; metricName: %s",
 						ex.Timestamp, minTimestamp, metricName)
 				}
@@ -1700,7 +1700,7 @@ func (s *Storage) addExemplars(rows []rawExemplar, dstExs []*ExemplarRow, exs []
 				// Skip rows with too big timestamps significantly exceeding the current time.
 				if firstWarn == nil {
 					metricName := getUserReadableMetricName(ex.MetricNameRaw)
-					firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
+					firstWarn = fmt.Errorf("cannot insert exemplar with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
 						ex.Timestamp, maxTimestamp, metricName)
 				}
 				atomic.AddUint64(&s.tooBigTimestampRows, 1)

@@ -96,6 +96,7 @@ func (ctx *InsertCtx) WriteExemplar(metricNameRaw []byte, tsLabels []prompb.Labe
 	}
 
 	ex := &exs[len(exs)-1]
+	ctx.exemplars = exs
 	ex.InitFromPB(metricNameRaw, exemplar)
 
 	return metricNameRaw, nil

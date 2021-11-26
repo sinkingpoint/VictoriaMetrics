@@ -505,6 +505,7 @@ func (rrs *rawRowsShard) Len() int {
 }
 
 func (rrs *rawRowsShard) addExemplars(pt *partition, exemplars []rawExemplar) {
+	fmt.Printf("Adding %v to shards\n", exemplars)
 	rrs.mu.Lock()
 	if cap(rrs.exemplars) == 0 {
 		n := getMaxRawRowsPerShard()
@@ -586,7 +587,7 @@ func (pt *partition) addRowsPart(rows []rawRow, exemplars []rawExemplar) {
 	}
 
 	mp := getInmemoryPart()
-	mp.InitFromRows(rows)
+	mp.InitFromRowsWithExemplars(rows, exemplars)
 
 	// Make sure the part may be added.
 	if mp.ph.MinTimestamp > mp.ph.MaxTimestamp {

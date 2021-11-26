@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"sync"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
@@ -92,6 +94,16 @@ type rawExemplarMarshaler struct {
 	indexData []byte
 }
 
+func (rem *rawExemplarMarshaler) Reset() {
+	rem.currentOffset = 0
+	rem.rawValuesBuffer = rem.rawValuesBuffer[:0]
+	rem.valuesBuffer = rem.valuesBuffer[:0]
+	rem.timestampBuffer = rem.timestampBuffer[:0]
+	rem.tagsBuffer = rem.tagsBuffer[:0]
+	rem.data = rem.data[:0]
+	rem.indexData = rem.indexData[:0]
+}
+
 func (rem *rawExemplarMarshaler) marshalToInmemoryPart(mp *inmemoryPart, exemplars []rawExemplar) {
 	if len(exemplars) == 0 {
 		return
@@ -131,4 +143,28 @@ func (rem *rawExemplarMarshaler) marshalToInmemoryPart(mp *inmemoryPart, exempla
 		rem.data = rem.data[:0]
 		rem.indexData = rem.indexData[:0]
 	}
+}
+
+var rawExemplarMarshalers sync.Pool
+
+func getRawExemplarMarshaler() *rawExemplarMarshaler {
+	marshaler := rawExemplarMarshalers.Get()
+	if marshaler == nil {
+		marshaler = &rawExemplarMarshaler{
+			currentOffset:   0,
+			rawValuesBuffer: make([]float64, maxMetricRowsPerBlock),
+			valuesBuffer:    make([]int64, maxMetricRowsPerBlock),
+			timestampBuffer: make([]int64, maxMetricRowsPerBlock),
+			tagsBuffer:      make([]exemplarTags, maxMetricRowsPerBlock),
+			data:            make([]byte, maxMetricRowsPerBlock),
+			indexData:       make([]byte, maxMetricRowsPerBlock),
+		}
+	}
+
+	return marshaler.(*rawExemplarMarshaler)
+}
+
+func putRawExemplarMarshaler(rem *rawExemplarMarshaler) {
+	rem.Reset()
+	rawExemplarMarshalers.Put(rem)
 }

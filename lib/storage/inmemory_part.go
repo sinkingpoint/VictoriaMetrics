@@ -42,6 +42,11 @@ func (mp *inmemoryPart) InitFromRowsWithExemplars(rows []rawRow, exemplars []raw
 	rrm := getRawRowsMarshaler()
 	rrm.marshalToInmemoryPart(mp, rows)
 	putRawRowsMarshaler(rrm)
+
+	rem := getRawExemplarMarshaler()
+	rem.marshalToInmemoryPart(mp, exemplars)
+	putRawExemplarMarshaler(rem)
+
 	mp.creationTime = fasttime.UnixTimestamp()
 }
 
