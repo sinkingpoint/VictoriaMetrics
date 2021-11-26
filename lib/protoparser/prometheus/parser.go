@@ -59,11 +59,12 @@ func (rs *Rows) UnmarshalWithErrLogger(s string, errLogger func(s string)) {
 
 // Row is a single Prometheus row.
 type Row struct {
-	Metric    string
-	Tags      []Tag
-	Value     float64
-	Timestamp int64
-	Exemplar  Exemplar
+	Metric      string
+	Tags        []Tag
+	Value       float64
+	Timestamp   int64
+	HasExemplar bool
+	Exemplar    Exemplar
 }
 
 func (r *Row) reset() {
@@ -71,6 +72,8 @@ func (r *Row) reset() {
 	r.Tags = nil
 	r.Value = 0
 	r.Timestamp = 0
+	r.HasExemplar = false
+	r.Exemplar.Reset()
 }
 
 func skipTrailingComment(s string) string {
@@ -148,8 +151,11 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 	// Try parse out an exemplar from the trailer
 	n = strings.IndexByte(s, '#')
 	if n >= 0 {
-		tagsPool, _ = r.Exemplar.unmarshalExemplar(s[n:], tagsPool, noEscapes)
+		tagsPool, err = r.Exemplar.unmarshalExemplar(s[n:], tagsPool, noEscapes)
 		// Skip errors - it's just a comment
+		if err == nil {
+			r.HasExemplar = true
+		}
 	}
 
 	s = skipTrailingComment(s)
@@ -710,7 +716,13 @@ var numericChars = [256]bool{
 type Exemplar struct {
 	Tags      []Tag
 	Value     float64
-	Timestamp float64
+	Timestamp int64
+}
+
+func (e *Exemplar) Reset() {
+	e.Tags = e.Tags[:0]
+	e.Value = 0.
+	e.Timestamp = 0
 }
 
 func (e *Exemplar) unmarshalExemplar(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error) {
@@ -776,7 +788,6 @@ func (e *Exemplar) unmarshalExemplar(s string, tagsPool []Tag, noEscapes bool) (
 		return tagsPool, fmt.Errorf("cannot parse exemplar timestamp %q: %w", s, err)
 	}
 
-	e.Timestamp = ts
 	if ts >= -1<<31 && ts < 1<<31 {
 		// This looks like OpenMetrics timestamp in Unix seconds.
 		// Convert it to milliseconds.
@@ -785,5 +796,6 @@ func (e *Exemplar) unmarshalExemplar(s string, tagsPool []Tag, noEscapes bool) (
 		ts *= 1000
 	}
 
+	e.Timestamp = int64(ts)
 	return tagsPool, nil
 }

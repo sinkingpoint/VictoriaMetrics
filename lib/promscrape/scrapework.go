@@ -744,13 +744,18 @@ func (sw *scrapeWork) addRowToTimeseries(wc *writeRequestCtx, r *parser.Row, tim
 	if !sw.Config.HonorTimestamps || sampleTimestamp == 0 {
 		sampleTimestamp = timestamp
 	}
+
+	if !sw.Config.HonorTimestamps || r.Exemplar.Timestamp == 0 {
+		r.Exemplar.Timestamp = timestamp
+	}
+
 	wc.samples = append(wc.samples, prompbmarshal.Sample{
 		Value:     r.Value,
 		Timestamp: sampleTimestamp,
 	})
 
 	exemplarsLen := len(wc.exemplars)
-	if len(r.Exemplar.Tags) > 0 {
+	if r.HasExemplar {
 		ex := prompbmarshal.Exemplar{
 			Value:     r.Exemplar.Value,
 			Timestamp: int64(r.Exemplar.Timestamp),
